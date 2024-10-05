@@ -131,6 +131,7 @@ var (
 	ErrNkeysNotSupported           = errors.New("nats: nkeys not supported by the server")
 	ErrStaleConnection             = errors.New("nats: " + STALE_CONNECTION)
 	ErrTokenAlreadySet             = errors.New("nats: token and token handler both set")
+	ErrUserInfoAlreadySet          = errors.New("nats: cannot set user info callback and user/pass")
 	ErrMsgNotBound                 = errors.New("nats: message is not bound to subscription/connection")
 	ErrMsgNoReply                  = errors.New("nats: message does not have a reply")
 	ErrClientIPNotSupported        = errors.New("nats: client IP not supported by this server")
@@ -229,6 +230,9 @@ type SignatureHandler func([]byte) ([]byte, error)
 
 // AuthTokenHandler is used to generate a new token.
 type AuthTokenHandler func() string
+
+// UserInfoCB is used to pass the username and password when establishing connection.
+type UserInfoCB func() (string, string)
 
 // ReconnectDelayHandler is used to get from the user the desired
 // delay the library should pause before attempting to reconnect
@@ -442,6 +446,9 @@ type Options struct {
 
 	// Password sets the password to be used when connecting to a server.
 	Password string
+
+	// UserInfo sets the callback handler that will fetch the username and password.
+	UserInfo UserInfoCB
 
 	// Token sets the token to be used when connecting to a server.
 	Token string
@@ -1166,6 +1173,13 @@ func UserInfo(user, password string) Option {
 	}
 }
 
+func UserInfoHandler(cb UserInfoCB) Option {
+	return func(o *Options) error {
+		o.UserInfo = cb
+		return nil
+	}
+}
+
 // Token is an Option to set the token to use
 // when a token is not included directly in the URLs
 // and when a token handler is not provided.
@@ -1359,7 +1373,7 @@ func ProxyPath(path string) Option {
 func CustomInboxPrefix(p string) Option {
 	return func(o *Options) error {
 		if p == "" || strings.Contains(p, ">") || strings.Contains(p, "*") || strings.HasSuffix(p, ".") {
-			return fmt.Errorf("nats: invalid custom prefix")
+			return errors.New("nats: invalid custom prefix")
 		}
 		o.InboxPrefix = p
 		return nil
@@ -1814,7 +1828,7 @@ func (nc *Conn) addURLToPool(sURL string, implicit, saveTLSName bool) error {
 	if len(nc.srvPool) == 0 {
 		nc.ws = isWS
 	} else if isWS && !nc.ws || !isWS && nc.ws {
-		return fmt.Errorf("mixing of websocket and non websocket URLs is not allowed")
+		return errors.New("mixing of websocket and non websocket URLs is not allowed")
 	}
 
 	var tlsName string
@@ -2563,6 +2577,13 @@ func (nc *Conn) connectProto() (string, error) {
 		pass = o.Password
 		token = o.Token
 		nkey = o.Nkey
+
+		if nc.Opts.UserInfo != nil {
+			if user != _EMPTY_ || pass != _EMPTY_ {
+				return _EMPTY_, ErrUserInfoAlreadySet
+			}
+			user, pass = nc.Opts.UserInfo()
+		}
 	}
 
 	// Look for user jwt.
@@ -5792,7 +5813,7 @@ func NkeyOptionFromSeed(seedFile string) (Option, error) {
 		return nil, err
 	}
 	if !nkeys.IsValidPublicUserKey(pub) {
-		return nil, fmt.Errorf("nats: Not a valid nkey user seed")
+		return nil, errors.New("nats: Not a valid nkey user seed")
 	}
 	sigCB := func(nonce []byte) ([]byte, error) {
 		return sigHandler(nonce, seedFile)
