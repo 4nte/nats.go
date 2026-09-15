@@ -1,4 +1,4 @@
-// Copyright 2012-2023 The NATS Authors
+// Copyright 2012-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -13,18 +13,26 @@
 
 package nats
 
-////////////////////////////////////////////////////////////////////////////////
+// //////////////////////////////////////////////////////////////////////////////
 // Package scoped specific tests here..
-////////////////////////////////////////////////////////////////////////////////
+// //////////////////////////////////////////////////////////////////////////////
 
 import (
 	"bufio"
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"reflect"
 	"regexp"
@@ -94,10 +102,11 @@ func checkErrChannel(t *testing.T, errCh chan error) {
 }
 
 func TestVersionMatchesTag(t *testing.T) {
-	tag := os.Getenv("TRAVIS_TAG")
-	if tag == "" {
+	refType := os.Getenv("GITHUB_REF_TYPE")
+	if refType != "tag" {
 		t.SkipNow()
 	}
+	tag := os.Getenv("GITHUB_REF_NAME")
 	// We expect a tag of the form vX.Y.Z. If that's not the case,
 	// we need someone to have a look. So fail if first letter is not
 	// a `v`
@@ -206,9 +215,9 @@ func TestExpandPath(t *testing.T) {
 	}
 }
 
-////////////////////////////////////////////////////////////////////////////////
+// //////////////////////////////////////////////////////////////////////////////
 // ServerPool tests
-////////////////////////////////////////////////////////////////////////////////
+// //////////////////////////////////////////////////////////////////////////////
 
 var testServers = []string{
 	"nats://localhost:1222",
@@ -236,11 +245,11 @@ func TestSimplifiedURLs(t *testing.T) {
 				"host4:1234",
 				"host5:",
 				"host6",
-				"nats://[1:2:3:4]:1234",
-				"nats://[5:6:7:8]:",
-				"nats://[9:10:11:12]",
-				"[13:14:15:16]:",
-				"[17:18:19:20]:1234",
+				"nats://[::1:2:3:4]:1234",
+				"nats://[::5:6:7:8]:",
+				"nats://[::9:10:11:12]",
+				"[::13:14:15:16]:",
+				"[::17:18:19:20]:1234",
 			},
 			[]string{
 				"nats://host1:1234/",
@@ -250,11 +259,11 @@ func TestSimplifiedURLs(t *testing.T) {
 				"nats://host4:1234",
 				"nats://host5:4222",
 				"nats://host6:4222",
-				"nats://[1:2:3:4]:1234",
-				"nats://[5:6:7:8]:4222",
-				"nats://[9:10:11:12]:4222",
-				"nats://[13:14:15:16]:4222",
-				"nats://[17:18:19:20]:1234",
+				"nats://[::1:2:3:4]:1234",
+				"nats://[::5:6:7:8]:4222",
+				"nats://[::9:10:11:12]:4222",
+				"nats://[::13:14:15:16]:4222",
+				"nats://[::17:18:19:20]:1234",
 			},
 		},
 		{
@@ -263,17 +272,17 @@ func TestSimplifiedURLs(t *testing.T) {
 				"ws://host1:1234",
 				"ws://host2:",
 				"ws://host3",
-				"ws://[1:2:3:4]:1234",
-				"ws://[5:6:7:8]:",
-				"ws://[9:10:11:12]",
+				"ws://[::1:2:3:4]:1234",
+				"ws://[::5:6:7:8]:",
+				"ws://[::9:10:11:12]",
 			},
 			[]string{
 				"ws://host1:1234",
 				"ws://host2:80",
 				"ws://host3:80",
-				"ws://[1:2:3:4]:1234",
-				"ws://[5:6:7:8]:80",
-				"ws://[9:10:11:12]:80",
+				"ws://[::1:2:3:4]:1234",
+				"ws://[::5:6:7:8]:80",
+				"ws://[::9:10:11:12]:80",
 			},
 		},
 		{
@@ -282,17 +291,17 @@ func TestSimplifiedURLs(t *testing.T) {
 				"wss://host1:1234",
 				"wss://host2:",
 				"wss://host3",
-				"wss://[1:2:3:4]:1234",
-				"wss://[5:6:7:8]:",
-				"wss://[9:10:11:12]",
+				"wss://[::1:2:3:4]:1234",
+				"wss://[::5:6:7:8]:",
+				"wss://[::9:10:11:12]",
 			},
 			[]string{
 				"wss://host1:1234",
 				"wss://host2:443",
 				"wss://host3:443",
-				"wss://[1:2:3:4]:1234",
-				"wss://[5:6:7:8]:443",
-				"wss://[9:10:11:12]:443",
+				"wss://[::1:2:3:4]:1234",
+				"wss://[::5:6:7:8]:443",
+				"wss://[::9:10:11:12]:443",
 			},
 		},
 	} {
@@ -307,8 +316,8 @@ func TestSimplifiedURLs(t *testing.T) {
 			}
 			// Check server pool directly
 			for i, u := range nc.srvPool {
-				if u.url.String() != test.expected[i] {
-					t.Fatalf("Expected url %q, got %q", test.expected[i], u.url.String())
+				if u.URL.String() != test.expected[i] {
+					t.Fatalf("Expected url %q, got %q", test.expected[i], u.URL.String())
 				}
 			}
 		})
@@ -325,7 +334,7 @@ func TestServersRandomize(t *testing.T) {
 	// Build []string from srvPool
 	clientServers := []string{}
 	for _, s := range nc.srvPool {
-		clientServers = append(clientServers, s.url.String())
+		clientServers = append(clientServers, s.URL.String())
 	}
 	// In theory this could happen..
 	if reflect.DeepEqual(testServers, clientServers) {
@@ -343,7 +352,7 @@ func TestServersRandomize(t *testing.T) {
 	// Build []string from srvPool
 	clientServers = []string{}
 	for _, s := range nc.srvPool {
-		clientServers = append(clientServers, s.url.String())
+		clientServers = append(clientServers, s.URL.String())
 	}
 	if !reflect.DeepEqual(testServers, clientServers) {
 		t.Fatalf("ServerPool list should not be randomized\n")
@@ -363,7 +372,7 @@ func TestServersRandomize(t *testing.T) {
 	// Build []string from srvPool
 	clientServers = []string{}
 	for _, s := range nc.srvPool {
-		clientServers = append(clientServers, s.url.String())
+		clientServers = append(clientServers, s.URL.String())
 	}
 	// In theory this could happen..
 	if reflect.DeepEqual(testServers, clientServers) {
@@ -383,7 +392,7 @@ func TestSelectNextServer(t *testing.T) {
 		t.Fatalf("Problem setting up Server Pool: %v\n", err)
 	}
 	if nc.current != nc.srvPool[0] {
-		t.Fatalf("Wrong default selection: %v\n", nc.current.url)
+		t.Fatalf("Wrong default selection: %v\n", nc.current.URL)
 	}
 
 	sel, err := nc.selectNextServer()
@@ -394,18 +403,18 @@ func TestSelectNextServer(t *testing.T) {
 	if len(nc.srvPool) != len(testServers) {
 		t.Fatalf("List is incorrect size: %d vs %d\n", len(nc.srvPool), len(testServers))
 	}
-	if nc.current.url.String() != testServers[1] {
-		t.Fatalf("Selection incorrect: %v vs %v\n", nc.current.url, testServers[1])
+	if nc.current.URL.String() != testServers[1] {
+		t.Fatalf("Selection incorrect: %v vs %v\n", nc.current.URL, testServers[1])
 	}
-	if nc.srvPool[len(nc.srvPool)-1].url.String() != testServers[0] {
+	if nc.srvPool[len(nc.srvPool)-1].URL.String() != testServers[0] {
 		t.Fatalf("Did not push old to last position\n")
 	}
 	if sel != nc.srvPool[0] {
-		t.Fatalf("Did not return correct server: %v vs %v\n", sel.url, nc.srvPool[0].url)
+		t.Fatalf("Did not return correct server: %v vs %v\n", sel.URL, nc.srvPool[0].URL)
 	}
 
 	// Test that we do not keep servers where we have tried to reconnect past our limit.
-	nc.srvPool[0].reconnects = int(opts.MaxReconnect)
+	nc.srvPool[0].Reconnects = int(opts.MaxReconnect)
 	if _, err := nc.selectNextServer(); err != nil {
 		t.Fatalf("Got an err: %v\n", err)
 	}
@@ -413,10 +422,10 @@ func TestSelectNextServer(t *testing.T) {
 	if len(nc.srvPool) != len(testServers)-1 {
 		t.Fatalf("List is incorrect size: %d vs %d\n", len(nc.srvPool), len(testServers)-1)
 	}
-	if nc.current.url.String() != testServers[2] {
-		t.Fatalf("Selection incorrect: %v vs %v\n", nc.current.url, testServers[2])
+	if nc.current.URL.String() != testServers[2] {
+		t.Fatalf("Selection incorrect: %v vs %v\n", nc.current.URL, testServers[2])
 	}
-	if nc.srvPool[len(nc.srvPool)-1].url.String() == testServers[1] {
+	if nc.srvPool[len(nc.srvPool)-1].URL.String() == testServers[1] {
 		t.Fatalf("Did not throw away the last server correctly\n")
 	}
 }
@@ -1000,7 +1009,7 @@ func TestAsyncINFO(t *testing.T) {
 	c.setupServerPool()
 
 	// Partials requiring argBuf
-	expectedServer := serverInfo{
+	expectedServer := ServerInfo{
 		ID:           "test",
 		Host:         "localhost",
 		Port:         4222,
@@ -1112,13 +1121,13 @@ func TestAsyncINFO(t *testing.T) {
 	// Capture the pool sequence after randomization
 	urlsAfterPoolSetup := make([]string, 0, len(c.srvPool))
 	for _, srv := range c.srvPool {
-		urlsAfterPoolSetup = append(urlsAfterPoolSetup, srv.url.Host)
+		urlsAfterPoolSetup = append(urlsAfterPoolSetup, srv.URL.Host)
 	}
 	checkNewURLsAddedRandomly := func() {
 		t.Helper()
 		var ok bool
 		for i := 0; i < len(urlsAfterPoolSetup); i++ {
-			if c.srvPool[i].url.Host != urlsAfterPoolSetup[i] {
+			if c.srvPool[i].URL.Host != urlsAfterPoolSetup[i] {
 				ok = true
 				break
 			}
@@ -1138,7 +1147,7 @@ func TestAsyncINFO(t *testing.T) {
 	}
 	checkNewURLsAddedRandomly()
 	// Check that we have not moved the first URL
-	if u := c.srvPool[0].url.Host; u != urlsAfterPoolSetup[0] {
+	if u := c.srvPool[0].URL.Host; u != urlsAfterPoolSetup[0] {
 		t.Fatalf("Expected first URL to be %q, got %q", urlsAfterPoolSetup[0], u)
 	}
 }
@@ -1192,6 +1201,30 @@ func TestConnServers(t *testing.T) {
 	c.setupServerPool()
 
 	validateURLs(c.Servers(), "nats://localhost:4333", "nats://localhost:4444")
+}
+
+func TestIgnoreDiscoveredServers(t *testing.T) {
+	opts := GetDefaultOptions()
+	opts.IgnoreDiscoveredServers = true
+	c := &Conn{Opts: opts}
+	c.ps = &parseState{}
+	c.setupServerPool()
+
+	if len(c.Servers()) != 1 {
+		t.Fatalf("Expected 1 server, got %d", len(c.Servers()))
+	}
+
+	err := c.parse([]byte("INFO {\"connect_urls\":[\"localhost:5222\", \"localhost:6222\"]}\r\n"))
+	if err != nil {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
+	}
+
+	if len(c.Servers()) != 1 {
+		t.Fatalf("Expected 1 server, got %d: %v", len(c.Servers()), c.Servers())
+	}
+	if len(c.DiscoveredServers()) != 0 {
+		t.Fatalf("Expected no discovered servers, got %v", c.DiscoveredServers())
+	}
 }
 
 func TestNoEchoOldServer(t *testing.T) {
@@ -1611,7 +1644,6 @@ func TestHeaderMultiLine(t *testing.T) {
 	http.Header(m.Header).Add("AUTHORIZATION", "s3cr3t")
 
 	// Multi Value Header becomes represented as multi-lines in the wire
-	// since internally using same Write from http stdlib.
 	m.Header.Set("X-Test", "First")
 	m.Header.Add("X-Test", "Second")
 	m.Header.Add("X-Test", "Third")
@@ -1622,24 +1654,101 @@ func TestHeaderMultiLine(t *testing.T) {
 	}
 	result := string(b)
 
-	expectedHeader := `NATS/1.0
-Accept-Encoding: json
-Authorization: s3cr3t
-CorrelationID: 123
-Msg-ID: 456
-X-NATS-Keys: A
-X-NATS-Keys: B
-X-NATS-Keys: C
-X-Test: First
-X-Test: Second
-X-Test: Third
-X-Test-Keys: D
-X-Test-Keys: E
-X-Test-Keys: F
+	// Require the header string to have a known prefix and suffix
+	if !strings.HasPrefix(result, "NATS/1.0\r\n") {
+		t.Fatalf("header prefix not present")
+	}
+	if !strings.HasSuffix(result, "\r\n\r\n") {
+		t.Fatalf("header suffix not present")
+	}
 
-`
-	if strings.Replace(expectedHeader, "\n", "\r\n", -1) != result {
-		t.Fatalf("Expected: %q, got: %q", expectedHeader, result)
+	// Require the header string to contain each of the following rows. Note
+	// that headers can be written in any order.
+	expectedHeaderLines := []string{
+		"Accept-Encoding: json\r\n",
+		"Authorization: s3cr3t\r\n",
+		"CorrelationID: 123\r\n",
+		"Msg-ID: 456\r\n",
+		"X-NATS-Keys: A\r\n",
+		"X-NATS-Keys: B\r\n",
+		"X-NATS-Keys: C\r\n",
+		"X-Test: First\r\n",
+		"X-Test: Second\r\n",
+		"X-Test: Third\r\n",
+		"X-Test-Keys: D\r\n",
+		"X-Test-Keys: E\r\n",
+		"X-Test-Keys: F\r\n",
+	}
+	for _, h := range expectedHeaderLines {
+		if !strings.Contains(result, h) {
+			t.Fatalf("expected header line '%s' to be present", h)
+		}
+	}
+}
+
+func TestHeaderValidKeys(t *testing.T) {
+	const validChars = "!#$%&'*+-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ^_`abcdefghijklmnopqrstuvwxyz|~"
+
+	m := NewMsg("foo")
+	m.Header = Header{
+		validChars: []string{"value"},
+	}
+	if _, err := m.headerBytes(); err != nil {
+		t.Fatal(err.Error())
+	}
+}
+
+func TestHeaderInvalidKeys(t *testing.T) {
+	testKeys := []string{
+		"",       // Empty string
+		":",      // Illegal printable ASCII character
+		"\r",     // Non-printable ASCII character
+		"\n",     // Non-printable ASCII character
+		"\t",     // Non-printable ASCII character
+		"\x00",   // Non-printable ASCII character
+		"→",      // Standard Unicode character
+		"\u200b", // Non-printable Unicode character
+	}
+	for _, key := range testKeys {
+		m := NewMsg("foo")
+		m.Header = Header{
+			key: []string{"value"},
+		}
+		if _, err := m.headerBytes(); err == nil {
+			t.Fatalf("expected error for key '%s'", key)
+		}
+	}
+}
+
+func TestHeaderValidValues(t *testing.T) {
+	testValues := []string{
+		"!\"#$%&'()*+,-./0123456789;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~",                              // Printable ASCII characters
+		"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0b\x0c\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1c\x1d\x1e\x1f", // Invisible ASCII characters (except CR/LF)
+		"→",      // Standard Unicode characters
+		"\u200b", // Non-printable Unicode characters
+	}
+	for _, v := range testValues {
+		m := NewMsg(v)
+		m.Header = Header{
+			"key": []string{v},
+		}
+		if _, err := m.headerBytes(); err != nil {
+			t.Fatal(err.Error())
+		}
+	}
+}
+
+func TestHeaderNewlineValue(t *testing.T) {
+	m := NewMsg("foo")
+	m.Header.Set("X-Test", "line1\nline2\rline3")
+
+	b, err := m.headerBytes()
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	out := string(b)
+	if !strings.Contains(out, "X-Test: line1 line2 line3") {
+		t.Fatalf("expected sanitized 'X-Test: line1 line2 line3', got: %q", out)
 	}
 }
 
@@ -1775,6 +1884,346 @@ func BenchmarkHeaderDecode(b *testing.B) {
 				if _, err := DecodeHeadersMsg(hdr); err != nil {
 					b.Fatalf("Unexpected error: %v", err)
 				}
+			}
+		})
+	}
+}
+
+// mockConn simulates a network connection that can fail and recover
+// after a number of attempts.
+type mockConn struct {
+	failures          int
+	temporaryFailures int
+	data              []byte
+}
+
+func (mc *mockConn) Write(p []byte) (int, error) {
+	if mc.failures < mc.temporaryFailures {
+		mc.failures++
+		return 0, &net.OpError{Op: "write", Net: "tcp", Err: errors.New("i/o timeout")}
+	}
+	mc.data = append(mc.data, p...)
+	return len(p), nil
+}
+
+func (mc *mockConn) SetWriteDeadline(t time.Time) error { return nil }
+func (mc *mockConn) Read(b []byte) (int, error)         { return 0, nil }
+func (mc *mockConn) Close() error                       { return nil }
+func (mc *mockConn) LocalAddr() net.Addr                { return nil }
+func (mc *mockConn) RemoteAddr() net.Addr               { return nil }
+func (mc *mockConn) SetDeadline(t time.Time) error      { return nil }
+func (mc *mockConn) SetReadDeadline(t time.Time) error  { return nil }
+
+func TestTimeoutWriterRecovery(t *testing.T) {
+	mc := &mockConn{temporaryFailures: 2}
+	tw := &timeoutWriter{
+		timeout: time.Second,
+		conn:    mc,
+	}
+	n, err := tw.Write([]byte("foo"))
+	if err == nil {
+		t.Fatal("Unexpected success")
+	}
+	if n != 0 {
+		t.Fatalf("Expected 0 bytes, got %d", n)
+	}
+	n, err = tw.Write([]byte("bar"))
+	if err == nil {
+		t.Fatal("Unexpected success")
+	}
+	if n != 0 {
+		t.Fatalf("Expected 0 bytes, got: %d", n)
+	}
+
+	// Should succeed since it was a temporary error.
+	testData := []byte("quux")
+	n, err = tw.Write(testData)
+	if err != nil {
+		t.Fatalf("Expected success, got: %v", err)
+	}
+	if n != len(testData) {
+		t.Fatalf("Expected %d, got: %d", len(testData), n)
+	}
+	if !bytes.Equal(mc.data, testData) {
+		t.Fatalf("Expected %q, got: %q", testData, mc.data)
+	}
+	testData2 := []byte("quuz")
+	n, err = tw.Write(testData2)
+	if err != nil {
+		t.Fatalf("Expected success, got: %v", err)
+	}
+	if n != len(testData2) {
+		t.Fatalf("Expected %d bytes written, got %d", len(testData2), n)
+	}
+	expectedData := append(testData, testData2...)
+	if !bytes.Equal(mc.data, expectedData) {
+		t.Fatalf("Expected data %q, got %q", expectedData, mc.data)
+	}
+}
+
+func TestValidateSubject(t *testing.T) {
+	tests := []struct {
+		name    string
+		subject string
+		wantErr bool
+	}{
+		{"valid short", "foo", false},
+		{"valid with dots", "foo.bar.baz", false},
+		{"valid long", "metrics.production.server01.cpu.usage.percent", false},
+		{"empty string", "", true},
+		{"contains space", "foo bar", true},
+		{"contains tab", "foo\tbar", true},
+		{"contains CR", "foo\rbar", true},
+		{"contains LF", "foo\nbar", true},
+		{"space at start", " foo", true},
+		{"space at end", "foo ", true},
+		{"tab at start", "\tfoo", true},
+		{"newline at end", "foo\n", true},
+		{"valid with wildcards", "foo.*.bar.>", false},
+		{"valid with hyphen", "foo-bar-baz", false},
+		{"valid with underscore", "foo_bar_baz", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSubject(tt.subject)
+			if tt.wantErr {
+				if !errors.Is(err, ErrBadSubject) {
+					t.Errorf("validateSubject(%q) error = %v, want ErrBadSubject", tt.subject, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("validateSubject(%q) unexpected error: %v", tt.subject, err)
+			}
+		})
+	}
+}
+
+func TestWriteBufferSize(t *testing.T) {
+	opts := GetDefaultOptions()
+	opts.WriteBufferSize = 64 * 1024
+	opts.Servers = []string{"nats://127.0.0.1:4222"}
+	nc := &Conn{Opts: opts}
+	nc.newReaderWriter()
+
+	if nc.bw.limit != 64*1024 {
+		t.Fatalf("Expected write buffer limit of %d, got %d", 64*1024, nc.bw.limit)
+	}
+	if len(nc.br.buf) != defaultBufSize {
+		t.Fatalf("Expected read buffer size of %d, got %d", defaultBufSize, len(nc.br.buf))
+	}
+}
+
+func TestWriteBufferSizeDefault(t *testing.T) {
+	opts := GetDefaultOptions()
+	opts.WriteBufferSize = DefaultWriteBufSize
+	opts.Servers = []string{"nats://127.0.0.1:4222"}
+	nc := &Conn{Opts: opts}
+	nc.newReaderWriter()
+
+	if nc.bw.limit != defaultBufSize {
+		t.Fatalf("Expected default write buffer limit of %d, got %d", defaultBufSize, nc.bw.limit)
+	}
+}
+
+// errInProcessProvider is a stub InProcessConnProvider that always fails. Used
+// to confirm Connect routes through InProcessConn and surfaces its errors.
+type errInProcessProvider struct{ err error }
+
+func (e *errInProcessProvider) InProcessConn() (net.Conn, error) { return nil, e.err }
+
+// TestInProcessServerOption verifies that nats.InProcessServer wires the
+// provider into Options. The happy path — reaching CONNECTED over an
+// in-process conn — needs an in-process server and is not covered.
+func TestInProcessServerOption(t *testing.T) {
+	provider := &errInProcessProvider{err: errors.New("placeholder")}
+	opts := Options{}
+	if err := InProcessServer(provider)(&opts); err != nil {
+		t.Fatalf("InProcessServer option returned error: %v", err)
+	}
+	if opts.InProcessServer == nil {
+		t.Fatal("Expected InProcessServer to be stored on Options")
+	}
+	if opts.InProcessServer != InProcessConnProvider(provider) {
+		t.Fatal("Expected stored provider to equal supplied provider")
+	}
+}
+
+// TestInProcessServerConnectError verifies that errors from the provider's
+// InProcessConn() call surface from Connect (wrapped, errors.Is-compatible).
+func TestInProcessServerConnectError(t *testing.T) {
+	providerErr := errors.New("provider broken")
+	provider := &errInProcessProvider{err: providerErr}
+
+	// URL is required for Options parsing but ignored when InProcessServer is set.
+	_, err := Connect("nats://placeholder:4222", InProcessServer(provider))
+	if err == nil {
+		t.Fatal("Expected error from Connect when provider fails")
+	}
+	if !errors.Is(err, providerErr) {
+		t.Fatalf("Expected error to wrap %v, got: %v", providerErr, err)
+	}
+}
+
+// TestParseServerURLPreservesTLSName covers the implicit-IP-URL → preserved-
+// hostname behavior in parseServerURL: when a gossiped (implicit) server URL
+// is an IP and the connection is secure, the entry's tlsName is set to the
+// hostname of the currently-connected URL so the TLS handshake (later, at
+// nats.go:2533) uses that hostname for ServerName verification instead of
+// the dialed IP. This is the same invariant the integration test
+// TestReconnectTLSHostNoIP exercises end-to-end (skipped: needs per-server
+// cluster config asymmetry the testservice does not expose); the white-box
+// form covers the same 14-line correctness boundary without the scaffolding.
+func TestParseServerURLPreservesTLSName(t *testing.T) {
+	current, err := url.Parse("tls://localhost:5222")
+	if err != nil {
+		t.Fatalf("could not parse current URL: %v", err)
+	}
+	nc := &Conn{current: &Server{URL: current}}
+
+	cases := []struct {
+		name         string
+		input        string
+		implicit     bool
+		saveTLSName  bool
+		expectedName string
+	}{
+		{"gossiped IP secure", "tls://127.0.0.1:5224", true, true, "localhost"},
+		{"gossiped hostname secure", "tls://other.example.com:5224", true, true, ""},
+		{"gossiped IP insecure", "tls://127.0.0.1:5224", true, false, ""},
+		{"explicit IP", "tls://127.0.0.1:5224", false, true, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := nc.parseServerURL(tc.input, tc.implicit, tc.saveTLSName)
+			if err != nil {
+				t.Fatalf("parseServerURL: %v", err)
+			}
+			if s.tlsName != tc.expectedName {
+				t.Fatalf("tlsName = %q, want %q", s.tlsName, tc.expectedName)
+			}
+			if s.isImplicit != tc.implicit {
+				t.Fatalf("isImplicit = %v, want %v", s.isImplicit, tc.implicit)
+			}
+		})
+	}
+}
+
+// hostOnlyTLSCert mints a self-signed cert carrying a single "localhost" DNS
+// SAN and deliberately no IP SANs, so verifying it against an IP-form
+// ServerName fails. Returns the server cert and a pool trusting it.
+func hostOnlyTLSCert(t *testing.T) (tls.Certificate, *x509.CertPool) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "localhost"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		DNSNames:              []string{"localhost"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("CreateCertificate: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("ParseCertificate: %v", err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(leaf)
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}, pool
+}
+
+// TestMakeTLSConnUsesPreservedTLSName covers the consumer side of the tlsName
+// invariant: parseServerURL records the originally-dialed hostname on a pool
+// entry (see TestParseServerURLPreservesTLSName), and makeTLSConn must use it
+// as the TLS ServerName rather than the IP it is dialing.
+//
+// This is what lets a client reconnect over TLS to a server the cluster
+// gossiped as a bare IP, against a cert that only has hostname SANs.
+func TestMakeTLSConnUsesPreservedTLSName(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		tlsName   string
+		expectErr bool
+	}{
+		// Dialed by IP, but tlsName carries the hostname the pool entry was
+		// discovered from: handshake must verify against "localhost".
+		{"preserved name is used", "localhost", false},
+		// Without it, ServerName falls back to the dialed IP, which the cert
+		// does not cover. Guards against the assignment being dropped.
+		{"no preserved name fails against IP", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srvCert, pool := hostOnlyTLSCert(t)
+
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("Listen: %v", err)
+			}
+			defer ln.Close()
+
+			sniCh := make(chan string, 1)
+			go func() {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				srv := tls.Server(conn, &tls.Config{
+					Certificates: []tls.Certificate{srvCert},
+					GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+						sniCh <- chi.ServerName
+						return nil, nil
+					},
+				})
+				srv.Handshake()
+			}()
+
+			raw, err := net.Dial("tcp", ln.Addr().String())
+			if err != nil {
+				t.Fatalf("Dial: %v", err)
+			}
+			defer raw.Close()
+
+			u, err := url.Parse("tls://" + ln.Addr().String())
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			nc := &Conn{
+				Opts:    Options{TLSConfig: &tls.Config{RootCAs: pool}},
+				conn:    raw,
+				current: &Server{URL: u, tlsName: tc.tlsName},
+			}
+			nc.newReaderWriter()
+
+			err = nc.makeTLSConn()
+			if tc.expectErr {
+				if err == nil {
+					t.Fatal("Expected TLS handshake to fail without a preserved tlsName")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("makeTLSConn: %v", err)
+			}
+
+			select {
+			case sni := <-sniCh:
+				if sni != "localhost" {
+					t.Fatalf("SNI = %q, want %q", sni, "localhost")
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("Did not receive ClientHello")
 			}
 		})
 	}

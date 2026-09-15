@@ -14,6 +14,7 @@
 package nats
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -224,6 +225,51 @@ func TestWSParseControlFrames(t *testing.T) {
 	}
 }
 
+func TestWSDataBeforeCloseFrame(t *testing.T) {
+	mr := &fakeReader{ch: make(chan []byte, 1)}
+	defer mr.close()
+	r := wsNewReader(mr)
+
+	p := make([]byte, 100)
+
+	// Simulate what happens when a NATS server sends an -ERR message
+	// followed by a WebSocket close frame in the same TCP read.
+	// This is the case described in https://github.com/nats-io/nats.go/issues/2024:
+	// the server sends "-ERR 'Authorization Violation'\r\n" as a text frame,
+	// immediately followed by a WebSocket close frame. The data frame must
+	// be returned to the caller before the close frame's io.EOF.
+	errMsg := []byte("-ERR 'Authorization Violation'\r\n")
+
+	// Binary frame (final=true) with the error message.
+	mr.buf.Write([]byte{byte(wsBinaryMessage) | wsFinalBit, byte(len(errMsg))})
+	mr.buf.Write(errMsg)
+	// Close frame with status 1000 and body "Authentication Failure".
+	closeBody := "Authentication Failure"
+	closePayloadLen := 2 + len(closeBody) // 2 bytes for status + body
+	mr.buf.Write([]byte{byte(wsCloseMessage) | wsFinalBit, byte(closePayloadLen)})
+	// Status code 1000 (normal closure) in network byte order.
+	mr.buf.Write([]byte{0x03, 0xE8})
+	mr.buf.WriteString(closeBody)
+
+	// First Read should return the -ERR data, not an error.
+	n, err := r.Read(p)
+	if err != nil {
+		t.Fatalf("Expected data to be returned before close, got error: %v", err)
+	}
+	if !bytes.Equal(p[:n], errMsg) {
+		t.Fatalf("Expected %q, got %q", errMsg, p[:n])
+	}
+
+	// Second Read should now return the deferred io.EOF from the close frame.
+	n, err = r.Read(p)
+	if err != io.EOF {
+		t.Fatalf("Expected io.EOF, got n=%v err=%v", n, err)
+	}
+	if n != 0 {
+		t.Fatalf("Expected 0 bytes on close, got %v", n)
+	}
+}
+
 func TestWSParseInvalidFrames(t *testing.T) {
 
 	newReader := func() (*fakeReader, *websocketReader) {
@@ -310,6 +356,32 @@ func TestWSParseInvalidFrames(t *testing.T) {
 	mr.buf.WriteString("ABC")
 	n, err = r.Read(p)
 	if n != 0 || err == nil || !strings.Contains(err.Error(), "unknown opcode") {
+		t.Fatalf("Unexpected error: n=%v err=%v", n, err)
+	}
+
+	// 64-bit frame length with MSB set
+	mr, r = newReader()
+	mr.buf.Write([]byte{130, 127, 128, 0, 0, 0, 0, 0, 0, 1})
+	n, err = r.Read(p)
+	if n != 0 || err == nil || !strings.Contains(err.Error(), "MSB set") {
+		t.Fatalf("Unexpected error: n=%v err=%v", n, err)
+	}
+
+	// 64-bit frame length exceeding absolute max (64MB)
+	mr, r = newReader()
+	mr.buf.Write([]byte{130, 127, 0, 0, 0, 0, 8, 0, 0, 0}) // 128MB
+	n, err = r.Read(p)
+	if n != 0 || err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("Unexpected error: n=%v err=%v", n, err)
+	}
+
+	// 64-bit frame length exceeding MaxPayload-derived limit
+	mr, r = newReader()
+	r.nc = &Conn{}
+	r.nc.info.MaxPayload = 1024 * 1024                     // 1MB -> max frame = 8MB
+	mr.buf.Write([]byte{130, 127, 0, 0, 0, 0, 1, 0, 0, 0}) // 16MB
+	n, err = r.Read(p)
+	if n != 0 || err == nil || !strings.Contains(err.Error(), "too large") {
 		t.Fatalf("Unexpected error: n=%v err=%v", n, err)
 	}
 }
@@ -554,9 +626,9 @@ func TestWSTlsNoConfig(t *testing.T) {
 	}
 	nc.mu.Lock()
 	for _, srv := range nc.srvPool {
-		if srv.url.Scheme != wsSchemeTLS {
+		if srv.URL.Scheme != wsSchemeTLS {
 			nc.mu.Unlock()
-			t.Fatalf("Expected scheme to be %q, got url: %s", wsSchemeTLS, srv.url)
+			t.Fatalf("Expected scheme to be %q, got url: %s", wsSchemeTLS, srv.URL)
 		}
 	}
 	nc.mu.Unlock()
@@ -606,5 +678,210 @@ func TestWSProxyPath(t *testing.T) {
 				t.Fatal("Proxy was not reached")
 			}
 		})
+	}
+}
+
+func TestWSURLPath(t *testing.T) {
+	l, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("Error in listen: %v", err)
+	}
+	defer l.Close()
+
+	port := l.Addr().(*net.TCPAddr).Port
+
+	ch := make(chan string, 1)
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ch <- r.URL.RequestURI()
+		}),
+	}
+	defer srv.Shutdown(context.Background())
+	go srv.Serve(l)
+
+	for _, test := range []struct {
+		name     string
+		path     string
+		expected string
+	}{
+		{"with path", "/mypath", "/mypath"},
+		{"with nested path", "/my/nested/path", "/my/nested/path"},
+		{"with query params", "/mypath?token=abc&foo=bar", "/mypath?token=abc&foo=bar"},
+		{"query only", "/?token=abc", "/?token=abc"},
+		{"encoded query value", "/mypath?msg=hello%20world", "/mypath?msg=hello%20world"},
+		{"trailing slash with query", "/mypath/?key=val", "/mypath/?key=val"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			url := fmt.Sprintf("ws://127.0.0.1:%d%s", port, test.path)
+			nc, err := Connect(url)
+			if err == nil {
+				nc.Close()
+				t.Fatal("Did not expect to connect")
+			}
+			select {
+			case got := <-ch:
+				if got != test.expected {
+					t.Fatalf("Expected URI %q, got %q", test.expected, got)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Server was not reached")
+			}
+		})
+	}
+
+	// ProxyPath option should take precedence over URL path.
+	t.Run("proxy path overrides url path", func(t *testing.T) {
+		url := fmt.Sprintf("ws://127.0.0.1:%d/url-path", port)
+		nc, err := Connect(url, ProxyPath("/override"))
+		if err == nil {
+			nc.Close()
+			t.Fatal("Did not expect to connect")
+		}
+		select {
+		case got := <-ch:
+			if got != "/override" {
+				t.Fatalf("Expected URI %q, got %q", "/override", got)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Server was not reached")
+		}
+	})
+
+	// Query params from the URL should be preserved even when ProxyPath is set.
+	t.Run("proxy path preserves query params", func(t *testing.T) {
+		url := fmt.Sprintf("ws://127.0.0.1:%d/ignored?token=secret", port)
+		nc, err := Connect(url, ProxyPath("/proxy"))
+		if err == nil {
+			nc.Close()
+			t.Fatal("Did not expect to connect")
+		}
+		select {
+		case got := <-ch:
+			if got != "/proxy?token=secret" {
+				t.Fatalf("Expected URI %q, got %q", "/proxy?token=secret", got)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Server was not reached")
+		}
+	})
+}
+
+// --- helpers ---
+
+func startHeaderCatcher(t *testing.T) (addr string, got chan []string, closer func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	got = make(chan []string, 1)
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			// surface nothing; test will timeout
+			return
+		}
+		defer conn.Close()
+		r := bufio.NewReader(conn)
+		var lines []string
+		for {
+			s, err := r.ReadString('\n')
+			if err != nil {
+				break
+			}
+			s = strings.TrimRight(s, "\r\n")
+			if s == "" { // end of HTTP headers
+				break
+			}
+			lines = append(lines, s)
+		}
+		got <- lines
+	}()
+
+	return ln.Addr().String(), got, func() { _ = ln.Close() }
+}
+
+func hasHeaderValue(headers []string, name, want string) bool {
+	prefix := strings.ToLower(name) + ":"
+	for _, h := range headers {
+		if !strings.HasPrefix(strings.ToLower(h), prefix) {
+			continue
+		}
+		val := strings.TrimSpace(strings.SplitN(h, ":", 2)[1])
+		for _, part := range strings.Split(val, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), want) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func TestWSHeaders_StaticAppliedOnHandshake(t *testing.T) {
+	addr, got, closeLn := startHeaderCatcher(t)
+	defer closeLn()
+
+	static := make(http.Header)
+	static.Set("Authorization", "Bearer Random Token")
+	static.Add("X-Multi", "v1")
+	static.Add("X-Multi", "v2")
+
+	// Intentionally connect to our fake server; it won't complete the upgrade.
+	opts := GetDefaultOptions()
+	opts.WebSocketConnectionHeaders = static
+	opts.Url = "ws://" + addr
+	_, err := opts.Connect()
+	if err == nil {
+		t.Fatalf("expected connect to fail because server does not reply")
+	}
+
+	var headers []string
+	select {
+	case headers = <-got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("did not capture headers in time")
+	}
+
+	if !hasHeaderValue(headers, "Authorization", "Bearer Random Token") {
+		t.Fatalf("Authorization header missing: %v", headers)
+	}
+	if !hasHeaderValue(headers, "X-Multi", "v1") || !hasHeaderValue(headers, "X-Multi", "v2") {
+		t.Fatalf("X-Multi headers missing/combined incorrectly: %v", headers)
+	}
+}
+
+func TestWSHeaders_HandlerAppliedOnHandshake(t *testing.T) {
+	addr, got, closeLn := startHeaderCatcher(t)
+	defer closeLn()
+
+	provider := func() (http.Header, error) {
+		h := make(http.Header)
+		h.Set("Authorization", "Bearer FromHandler")
+		h.Add("X-Multi", "h1")
+		h.Add("X-Multi", "h2")
+		return h, nil
+	}
+
+	opts := GetDefaultOptions()
+	opts.WebSocketConnectionHeadersHandler = provider
+	opts.Url = "ws://" + addr
+	_, err := opts.Connect()
+	if err == nil {
+		t.Fatalf("expected connect to fail because server does not reply")
+	}
+
+	var headers []string
+	select {
+	case headers = <-got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("did not capture headers in time")
+	}
+
+	if !hasHeaderValue(headers, "Authorization", "Bearer FromHandler") {
+		t.Fatalf("Authorization header missing: %v", headers)
+	}
+	if !hasHeaderValue(headers, "X-Multi", "h1") || !hasHeaderValue(headers, "X-Multi", "h2") {
+		t.Fatalf("X-Multi headers missing/combined incorrectly: %v", headers)
 	}
 }

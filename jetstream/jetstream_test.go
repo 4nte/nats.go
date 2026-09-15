@@ -117,6 +117,76 @@ func TestValidateSubject(t *testing.T) {
 	}
 }
 
+func TestValidateStreamName(t *testing.T) {
+	tests := []struct {
+		name      string
+		withError bool
+	}{
+		{"test", false},
+		{"test-stream_1", false},
+		{"", true},
+		{"stream.name", true},
+		{"stream name", true},
+		{"stream>", true},
+		{"stream*", true},
+		{"stream/name", true},
+		{"stream\\name", true},
+		{"stream\tname", true},
+		{"stream\rname", true},
+		{"stream\nname", true},
+	}
+
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("name=%q,err=%t", test.name, test.withError), func(t *testing.T) {
+			err := validateStreamName(test.name)
+			if test.withError {
+				if err == nil {
+					t.Fatal("Expected error; got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateConsumerName(t *testing.T) {
+	tests := []struct {
+		name      string
+		withError bool
+	}{
+		{"test", false},
+		{"test-consumer_1", false},
+		{"", true},
+		{"consumer.name", true},
+		{"consumer name", true},
+		{"consumer>", true},
+		{"consumer*", true},
+		{"consumer/name", true},
+		{"consumer\\name", true},
+		{"consumer\tname", true},
+		{"consumer\rname", true},
+		{"consumer\nname", true},
+	}
+
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("name=%q,err=%t", test.name, test.withError), func(t *testing.T) {
+			err := validateConsumerName(test.name)
+			if test.withError {
+				if err == nil {
+					t.Fatal("Expected error; got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestRetryWithBackoff(t *testing.T) {
 	tests := []struct {
 		name                  string
@@ -268,8 +338,9 @@ func TestRetryWithBackoff(t *testing.T) {
 			case <-time.After(test.timeout):
 				t.Fatalf("Timeout after %v", test.timeout)
 			}
+
 			if count != test.expectedAttemptsCount-1 {
-				t.Fatalf("Invalid count; want: %d; got: %d", test.expectedAttemptsCount, count)
+				t.Fatalf("Invalid count; got: %d, want: %d", count, test.expectedAttemptsCount-1)
 			}
 		})
 	}
@@ -430,13 +501,13 @@ func TestPullConsumer_checkPending(t *testing.T) {
 						}
 						ok <- struct{}{}
 					case <-time.After(1 * time.Second):
-						errs <- fmt.Errorf("Timeout")
+						errs <- errors.New("Timeout")
 						return
 					}
 				} else {
 					select {
 					case <-prChan:
-						errs <- fmt.Errorf("Unexpected pull request")
+						errs <- errors.New("Unexpected pull request")
 					case <-time.After(100 * time.Millisecond):
 						ok <- struct{}{}
 						return
@@ -453,6 +524,45 @@ func TestPullConsumer_checkPending(t *testing.T) {
 			}
 
 		})
+	}
+}
+
+func TestIsWrongLastSeqErr(t *testing.T) {
+	// 10164 is the replicated-stream variant of the 10071 "wrong last
+	// sequence" CAS conflict; both must be recognized (issue #2097).
+	for _, code := range []ErrorCode{JSErrCodeStreamWrongLastSequence, JSErrCodeStreamWrongLastSequenceConstant} {
+		if !isWrongLastSeqErr(&APIError{Code: 400, ErrorCode: code}) {
+			t.Fatalf("err code %d should be recognized as wrong-last-sequence", code)
+		}
+	}
+	if isWrongLastSeqErr(&APIError{Code: 404, ErrorCode: JSErrCodeStreamNotFound}) {
+		t.Fatal("unrelated error code should not be recognized")
+	}
+}
+
+func TestMapRevisionMismatch(t *testing.T) {
+	// Both 10071 and its replicated-stream variant 10164 must map to
+	// ErrKeyRevisionMismatch, while preserving the underlying
+	// APIError for callers that inspect the code.
+	for _, code := range []ErrorCode{JSErrCodeStreamWrongLastSequence, JSErrCodeStreamWrongLastSequenceConstant} {
+		err := mapRevisionMismatch(&APIError{Code: 400, ErrorCode: code})
+		if !errors.Is(err, ErrKeyRevisionMismatch) {
+			t.Fatalf("err code %d should map to ErrKeyRevisionMismatch, got: %v", code, err)
+		}
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.ErrorCode != code {
+			t.Fatalf("underlying APIError (code %d) should be preserved, got: %v", code, err)
+		}
+	}
+
+	// Unrelated errors pass through untouched.
+	other := &APIError{Code: 404, ErrorCode: JSErrCodeStreamNotFound}
+	if err := mapRevisionMismatch(other); err != other || errors.Is(err, ErrKeyRevisionMismatch) {
+		t.Fatalf("unrelated error should pass through unchanged, got: %v", err)
+	}
+
+	if mapRevisionMismatch(nil) != nil {
+		t.Fatal("nil should map to nil")
 	}
 }
 
